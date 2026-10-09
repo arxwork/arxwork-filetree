@@ -1,7 +1,7 @@
 {
-  "name": "claude-code-filetree",
+  "name": "arxwork-filetree",
   "owner": {
-    "name": "Kurt Buhler"
+    "name": "arxwork (fork of Kurt Buhler)"
   },
   "metadata": {
     "description": "An IDE-style file tree for Claude Code that shows what Claude is doing and where in files"
