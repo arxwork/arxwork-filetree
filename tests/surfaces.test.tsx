@@ -130,7 +130,9 @@ test('macOS Claude Code app: desktop pane draws, selects, opens with open', { ti
   const ui = await $.ui.mount({ plugin: 'filetree', surface: 'desktop', component: 'Pane', requestId: 'filetree', props: paneProps(60) })
   await clock.settle()
   const shown = await texts(ui)
-  for (const word of ['README.md', 'notes.md', 'src', 'main', 'origin/main']) expect(shown).toContain(word)
+  // arxwork: on desktop the branch line lives in the "Right now" card.
+  for (const word of ['README.md', 'notes.md', 'src', 'Nothing yet', '>PROJ</text>', '" +3"', '" -1"']) expect(shown).toContain(word)
+  expect(shown).not.toContain('not committed')
   expect(NERD.test(shown)).toBe(false)
   await ui.post({ press: `${root}/README.md` }, { in: 'rows' })
   await clock.settle()
@@ -846,3 +848,121 @@ for (const os of ['linux', 'win32'] as const) {
     await ui.unmount()
   })
 }
+
+// arxwork: the desktop "Right now" card follows Claude's reads and edits.
+test('desktop card: idle, then what Claude reads, is editing and edited', { timeoutMs: 20_000 }, async ($, on) => {
+  const ran: Ran = []
+  const root = '/Users/k/proj'
+  let ui: any
+  let during = ''
+  const clock = world(on, {
+    os: 'darwin', env: { HOME: '/Users/k', TMPDIR: '/var/folders/x/T/' }, cwd: root, top: root,
+    dirs: { [root]: [['src', 'dir'], ['README.md', 'file']], [`${root}/src`]: [['api.ts', 'file']] },
+    status: '## main\0', numstat: '',
+    tool: (e: any) => {
+      if (e.tool === 'Edit') return texts(ui).then(s => {
+        during = s
+        return { result: {} }
+      })
+      return undefined
+    },
+  }, ran)
+  await $.session.start({ cwd: root, surface: 'desktop', isInteractive: true })
+  await clock.settle()
+  ui = await $.ui.mount({ plugin: 'filetree', surface: 'desktop', component: 'Pane', requestId: 'filetree', props: paneProps(60) })
+  await clock.settle()
+  const idle = await texts(ui)
+  for (const word of ['Nothing yet']) expect(idle).toContain(word)
+  await $.tool.call({ tool: 'Read', file_path: `${root}/README.md` } as any)
+  await clock.settle()
+  const read = await texts(ui)
+  for (const word of ['>Just now</text>', '>READ</text>', '["README.md"]', '>PROJ</text>']) expect(read).toContain(word)
+  await $.tool.call({ tool: 'Edit', file_path: `${root}/src/api.ts`, old_string: 'a', new_string: 'b' } as any)
+  await clock.settle()
+  for (const word of ['>Right now</text>', '>EDITING</text>', '["api.ts"]', '>PROJ &gt; SRC</text>']) expect(during).toContain(word)
+  expect(await texts(ui)).toContain('>EDITED</text>')
+  await ui.unmount()
+})
+
+// arxwork: the card stack (newest on top, at most five), the "Claude touched" list, and row bars and pills.
+test('desktop stack: newest card on top, five at most; touched list; badges, bars and pills', { timeoutMs: 20_000 }, async ($, on) => {
+  const ran: Ran = []
+  const root = '/Users/k/proj'
+  let ui: any
+  let during = ''
+  const clock = world(on, {
+    os: 'darwin', env: { HOME: '/Users/k', TMPDIR: '/var/folders/x/T/' }, cwd: root, top: root,
+    dirs: {
+      [root]: [['src', 'dir'], ['README.md', 'file'], ['package.json', 'file']],
+      [`${root}/src`]: [['api.js', 'file'], ['b.js', 'file'], ['c.js', 'file'], ['d.js', 'file'], ['e.js', 'file']],
+    },
+    status: '## main\0', numstat: '',
+    tool: (e: any) => {
+      if (e.tool === 'Edit') return texts(ui).then(s => {
+        during = s
+        return { result: {} }
+      })
+      return undefined
+    },
+  }, ran)
+  await $.session.start({ cwd: root, surface: 'desktop', isInteractive: true })
+  await clock.settle()
+  ui = await $.ui.mount({ plugin: 'filetree', surface: 'desktop', component: 'Pane', requestId: 'filetree', props: { ...paneProps(60), scroll: { offset: 0, bodyRows: 90 } } })
+  await clock.settle()
+  const idle = await texts(ui)
+  for (const word of ['ALL FILES', 'PROJ', '{} file', 'MD file', 'folder', 'Nothing yet']) expect(idle).toContain(word)
+  expect(idle).not.toContain('CLAUDE TOUCHED')
+  for (const f of ['src/api.js', 'src/b.js', 'README.md']) await $.tool.call({ tool: 'Read', file_path: `${root}/${f}` } as any)
+  await clock.settle()
+  const three = await texts(ui)
+  const order = (s: string, names: string[]) => names.map(n => s.indexOf(`["${n}"]`))
+  const [r, b, a] = order(three, ['README.md', 'b.js', 'api.js'])
+  expect(r).toBeGreaterThan(-1)
+  expect(r).toBeLessThan(b ?? -1)
+  expect(b).toBeLessThan(a ?? -1)
+  for (const word of ['CLAUDE TOUCHED', '3 FILES', '"alt":"read"', 'rx=\\"9\\"', '#2a2140', '>PROJ &gt; SRC</text>']) expect(three).toContain(word)
+  await $.tool.call({ tool: 'Edit', file_path: `${root}/src/api.js`, old_string: 'a', new_string: 'b' } as any)
+  await clock.settle()
+  for (const word of ['"alt":"editing"', '#3a2516', '>EDITING</text>']) expect(during).toContain(word)
+  const edited = await texts(ui)
+  const [a2, r2] = order(edited, ['api.js', 'README.md'])
+  expect(a2).toBeLessThan(r2 ?? -1)
+  expect(edited).toContain('>EDITED</text>')
+  for (const f of ['src/c.js', 'src/d.js', 'src/e.js']) await $.tool.call({ tool: 'Read', file_path: `${root}/${f}` } as any)
+  await clock.settle()
+  const six = await texts(ui)
+  expect(six.split('viewBox=\\"0 0 36 36\\"').length - 1).toBe(5)
+  expect(six).toContain('6 FILES')
+  await ui.unmount()
+})
+
+// arxwork: editing in another project moves the desktop tree to that project's folder, and back.
+test('desktop tree follows the project Claude edits in', { timeoutMs: 20_000 }, async ($, on) => {
+  const ran: Ran = []
+  const root = '/Users/k/proj'
+  const other = '/Users/k/other'
+  const clock = world(on, {
+    os: 'darwin', env: { HOME: '/Users/k', TMPDIR: '/var/folders/x/T/' }, cwd: root, top: root,
+    dirs: {
+      '/Users/k': [['proj', 'dir'], ['other', 'dir']],
+      [root]: [['README.md', 'file']],
+      [other]: [['package.json', 'file'], ['lib', 'dir']],
+      [`${other}/lib`]: [['x.js', 'file']],
+    },
+    status: '## main\0', numstat: '',
+  }, ran)
+  await $.session.start({ cwd: root, surface: 'desktop', isInteractive: true })
+  await clock.settle()
+  const ui = await $.ui.mount({ plugin: 'filetree', surface: 'desktop', component: 'Pane', requestId: 'filetree', props: { ...paneProps(60), scroll: { offset: 0, bodyRows: 90 } } })
+  await clock.settle()
+  await $.tool.call({ tool: 'Edit', file_path: `${other}/lib/x.js`, old_string: 'a', new_string: 'b' } as any)
+  await clock.settle()
+  expect(await texts(ui)).toContain('OTHER')
+  expect(await texts(ui)).toContain('"t":"lib"')
+  await $.tool.call({ tool: 'Edit', file_path: `${root}/README.md`, old_string: 'a', new_string: 'b' } as any)
+  await clock.settle()
+  const back = await texts(ui)
+  expect(back).toContain('"t":"README.md"')
+  expect(back).not.toContain('"t":"lib"')
+  await ui.unmount()
+})

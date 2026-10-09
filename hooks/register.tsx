@@ -1,7 +1,9 @@
 import { type BuiltinToolResults, type EngineInterface, type Register, type Timer, update } from 'claude-code'
 import { openCommand } from './open'
 
-import type { Activity, FileNode, FileTree, Theme } from '../types'
+import type { Activity, ClaudeActivity, ClaudeNow, ClaudeTouch, FileNode, FileTree, Theme } from '../types'
+import { CARD_COLORS, CARD_FADE, CARD_GAP, CARD_ICON_PX, CARD_ROWS, type CardInput, fade, fit, TAG_PX_H, tagPx, tagSvg, timePx, timeSvg, toneIconSvg } from './card'
+import { DESK, fileBadge, ICON_CELLS, ICON_PX, iconSvg, pillCells, pillPx, pillSvg, ROW_STATES, type RowState, shortStamp } from './desktop'
 import { BRANCH_ICON, chainOf, type GitAction, gitActions, readOnly, readTargets, resolve, TONES } from './git'
 import type { RowSpec, RowsProps, Seg } from './rows'
 import { CHEVRON_CLOSED, CHEVRON_OPEN, fileIcon, GIT_COLOR } from './icons'
@@ -35,6 +37,10 @@ import {
 const TREE = { plugin: 'filetree', key: 'tree' } as const
 const THEME = { plugin: 'filetree', key: 'theme' } as const
 const ACTIVITY = { plugin: 'filetree', key: 'activity' } as const
+const CLAUDE = { plugin: 'filetree', key: 'claude' } as const
+const CLAUDE_TOUCHED_MAX = 50
+const STACK_MAX = 5
+const TOUCHED_ROWS = 6
 const PANE = 'filetree'
 const SHIMMER = Object.fromEntries(Object.entries(TONES).map(([k, v]) => [k, { bright: v.bright, dim: v.dim }]))
 const BRANCH_ROW = '#branch'
@@ -73,6 +79,8 @@ let noNerd = false
 let glyphSetting = 'auto'
 let follow = true
 let followClaude = true
+// arxwork: set once the pane is drawn on the desktop, where the tree follows Claude's task.
+let deskSeen = false
 let scanning: Promise<void> | null = null
 let scanJobs: Job[] = []
 let gitRun: Promise<void> | null = null
@@ -146,6 +154,134 @@ async function activities($: EngineInterface): Promise<Activity[]> {
 
 async function setActivities($: EngineInterface, fn: (list: Activity[]) => Activity[]): Promise<void> {
   await update($, ACTIVITY, cur => fn(cur ?? []).slice(-6))
+}
+
+// arxwork: Claude's file activity for the desktop card and the touched list.
+const NO_CLAUDE: ClaudeActivity = { now: null, touched: [] }
+
+async function claudeActivity($: EngineInterface): Promise<ClaudeActivity> {
+  return (await $.state.get(CLAUDE)).value ?? NO_CLAUDE
+}
+
+// Moves `paths` to the newest end of the touched list, `kind` the latest thing done to them.
+function touch(files: ClaudeTouch[], paths: string[], kind: ClaudeTouch['kind'], at: number): ClaudeTouch[] {
+  const byPath = new Map(files.map(x => [x.path, x]))
+  for (const path of paths) {
+    const was = byPath.get(path)
+    byPath.delete(path)
+    const edited = Boolean(was?.edited) || kind === 'edit'
+    byPath.set(path, { path, kind, at, ...(edited ? { edited } : {}) })
+  }
+  return [...byPath.values()].slice(-CLAUDE_TOUCHED_MAX)
+}
+
+async function noteClaude($: EngineInterface, kind: ClaudeNow['kind'], paths: string[], running: boolean): Promise<void> {
+  const last = paths[paths.length - 1]
+  if (!last) return
+  const at = await $.clock.now()
+  await update($, CLAUDE, cur => {
+    const c = cur ?? NO_CLAUDE
+    return { ...c, now: { path: last, kind, running, at }, touched: running ? c.touched : touch(c.touched, paths, kind, at) }
+  })
+}
+
+async function noteCommit($: EngineInterface, paths: string[]): Promise<void> {
+  const at = await $.clock.now()
+  await update($, CLAUDE, cur => {
+    const c = cur ?? NO_CLAUDE
+    return { ...c, committed: { paths, at }, touched: touch(c.touched, paths, 'commit', at) }
+  })
+}
+
+// The folder a file's project lives in: the session's folder when the file is inside it,
+// else the nearest folder above it holding a project marker, else the file's own folder.
+const PROJECT_MARKERS = ['.git', 'package.json', '.claude-plugin', 'Cargo.toml', 'pyproject.toml', 'go.mod', 'CLAUDE.md']
+
+async function projectRootOf($: EngineInterface, path: string): Promise<string> {
+  const cwd = await cwdOf($)
+  if (inside(cwd, path)) return cwd
+  let dir = dirname(path)
+  for (let i = 0; i < 12 && dir && dir !== home && dirname(dir) !== dir; i++, dir = dirname(dir)) {
+    for (const m of PROJECT_MARKERS) if (await exists($, join(dir, m))) return dir
+  }
+  return dirname(path)
+}
+
+// On the desktop, the tree jumps to the project Claude is editing in, and back to the session's folder.
+async function followTask($: EngineInterface, path: string): Promise<void> {
+  if (!deskSeen || !followClaude) return
+  const t = await get($)
+  if (t.root && inside(t.root, path)) return
+  const target = await projectRootOf($, path)
+  if (target === t.root) return
+  follow = target === (await cwdOf($))
+  await reset($, target)
+}
+
+function ago(ms: number): string {
+  const s = Math.max(0, Math.round(ms / 1000))
+  if (s < 60) return 'Just now'
+  if (s < 3600) return `${Math.floor(s / 60)} min ago`
+  return `${Math.floor(s / 3600)} h ago`
+}
+
+// "PROJECT > FILES": the project folder and the folders down to where `dirs` meet;
+// outside the project, the last two folder names. Deep paths keep the first and last.
+function folderTag(root: string, dirs: string[]): string {
+  const parts = dirs.map(d => d.split('/'))
+  const common: string[] = []
+  for (let i = 0; parts.every(p => i < p.length && p[i] === parts[0]?.[i]); i++) common.push(parts[0]?.[i] ?? '')
+  const dir = common.join('/') || '/'
+  const segs = inside(root, dir)
+    ? [root.split('/').pop() || root, ...dir.slice(root.length).split('/').filter(Boolean)]
+    : dir.split('/').filter(Boolean).slice(-2)
+  return (segs.length > 3 ? [segs[0], '…', segs[segs.length - 1]] : segs).join(' > ')
+}
+
+// The card stack, newest first: one card per file Claude touched (the one it is working on now
+// on top), and its git commands that name no files. At most STACK_MAX; an idle card when empty.
+function stackFor(t: FileTree, c: ClaudeActivity, git: Activity[], now: number): CardInput[] {
+  const items: { at: number; card: CardInput }[] = []
+  const seen = new Set<string>()
+  const fileCard = (path: string, kind: ClaudeTouch['kind'], running: boolean, at: number): { at: number; card: CardInput } => ({
+    at,
+    card: {
+      tone: kind === 'commit' ? 'git' : kind,
+      action: running ? (kind === 'edit' ? 'Editing' : 'Reading') : kind === 'commit' ? 'Committed' : kind === 'edit' ? 'Edited' : 'Read',
+      title: path.split('/').pop() || path,
+      tag: folderTag(t.root, [dirname(path)]),
+      time: running ? 'Right now' : ago(now - at),
+    },
+  })
+  const cur = c.now
+  if (cur?.running) {
+    items.push(fileCard(cur.path, cur.kind, true, cur.at))
+    seen.add(cur.path)
+  }
+  for (const x of [...c.touched].reverse()) {
+    if (items.length >= STACK_MAX) break
+    if (seen.has(x.path)) continue
+    seen.add(x.path)
+    items.push(fileCard(x.path, x.kind, false, x.at))
+  }
+  // A finished commit already shows as its files' cards.
+  const done = c.committed
+  for (const a of git) {
+    if (a.kind === 'git commit' && a.state === 'done' && done && Math.abs(done.at - a.at) < 15_000) continue
+    const running = a.state === 'running'
+    items.push({
+      at: a.at,
+      card: { tone: a.state === 'failed' ? 'failed' : 'git', action: a.label, title: a.detail.split(' ')[0] || t.branch?.head || '', tag: folderTag(t.root, [t.root]), time: running ? 'Right now' : ago(now - a.at) },
+    })
+  }
+  items.sort((a, b) => b.at - a.at)
+  const top = items.slice(0, STACK_MAX)
+  if (!top.length) return [{ tone: 'idle', time: '', action: '', title: 'Nothing yet', tag: folderTag(t.root, [t.root]) }]
+  return top.map(x => x.card)
+}
+
+async function settleClaude($: EngineInterface): Promise<void> {
+  await update($, CLAUDE, cur => (cur?.now?.running ? { ...cur, now: { ...cur.now, running: false } } : (cur ?? NO_CLAUDE)))
 }
 
 async function list($: EngineInterface, dir: string): Promise<FileNode[] | null> {
@@ -712,6 +848,7 @@ async function afterBash($: EngineInterface, jobs: Job[]): Promise<void> {
       await revealPaths($, found)
       const shown = new Set((await get($)).nodes.map(n => n.id))
       for (const r of found) if (shown.has(r) && !tones[r]) tones[r] = 'purple'
+      await noteClaude($, 'read', found, false)
     }
   }
   if (showWrites && actions.length) {
@@ -722,6 +859,9 @@ async function afterBash($: EngineInterface, jobs: Job[]): Promise<void> {
       await revealPaths($, paths)
       const shown = new Set((await get($)).nodes.map(n => n.id))
       for (const x of paths) if (shown.has(x)) tones[x] = 'green'
+      if (committed && paths.length) {
+        await noteCommit($, paths)
+      }
     }
     const pushLike = actions.find(a => ['push', 'pull', 'fetch', 'checkout', 'switch', 'branch', 'merge', 'rebase', 'tag'].includes(a.verb) || a.kind.startsWith('gh '))
     if (pushLike) tones[BRANCH_ROW] = pushLike.tone
@@ -750,6 +890,7 @@ function scheduleScan($: EngineInterface, job: Job): void {
 }
 
 async function touched($: EngineInterface, paths: string[], tone: string, show: boolean): Promise<void> {
+  if (tone === 'purple' || tone === 'orange') await noteClaude($, tone === 'purple' ? 'read' : 'edit', paths.map(posix), false)
   if (await followCwd($)) return
   const t = await get($)
   if (!t.root) return
@@ -982,10 +1123,16 @@ export const register: Register = (on, options) => {
     const before = actions.some(a => a.verb === 'commit') ? await get($) : null
     const head = before?.top ? await headOf($, before.root) : ''
     const pending: Pending | null = actions.length ? { actions, ids: await startGit($, actions), command, head } : null
+    const editing = e.tool === 'Bash' ? '' : 'file_path' in e && typeof e.file_path === 'string' ? e.file_path : 'notebook_path' in e && typeof e.notebook_path === 'string' ? e.notebook_path : ''
+    if (editing) {
+      await followTask($, posix(editing))
+      await noteClaude($, 'edit', [posix(editing)], true)
+    }
     let result: Awaited<ReturnType<typeof next>>
     try {
       result = await next(e)
     } catch (err) {
+      if (editing) await settleClaude($)
       if (pending) await finishGit($, pending, failAll(pending))
       if (since.mark) void $.process.run(['rm', '-f', since.mark], { timeoutMs: 3_000 }).catch(() => undefined)
       throw err
@@ -995,6 +1142,7 @@ export const register: Register = (on, options) => {
       void setActivities($, cur => cur.filter(a => !ids.includes(a.id)))
     }
     if (result.deny || (result.isError && e.tool !== 'Bash')) {
+      if (editing) await settleClaude($)
       if (since.mark) void $.process.run(['rm', '-f', since.mark], { timeoutMs: 3_000 }).catch(() => undefined)
       return result
     }
@@ -1023,10 +1171,37 @@ export const register: Register = (on, options) => {
   })
 
   on('tool.call', { tool: 'Read' }, async ($, e, next) => {
+    if (e.tool === 'Read') await noteClaude($, 'read', [posix(e.file_path)], true)
     const result = await next(e)
+    if (e.tool === 'Read') {
+      if (result.deny || result.isError) await settleClaude($)
+      else if (!showReads) await noteClaude($, 'read', [posix(e.file_path)], false)
+    }
     if (result.deny || result.isError || e.tool !== 'Read' || !showReads) return result
     void touched($, [posix(e.file_path)], 'purple', true)
     return result
+  })
+
+  // arxwork: a press in the "Claude touched" list shows that file in the tree, in its own project.
+  on('ui.message', { element: 'touched' }, async ($, e, next) => {
+    if (e.requestId !== PANE || !e.data || typeof e.data !== 'object') return next(e)
+    const data = e.data as { press?: unknown; copy?: unknown; shift?: unknown }
+    if (typeof data.copy === 'string') {
+      await copyPath($, data.copy, Boolean(data.shift), e.surface)
+      return {}
+    }
+    if (typeof data.press !== 'string' || !data.press) return {}
+    const path = data.press
+    const t = await get($)
+    if (!inside(t.root, path)) {
+      const target = await projectRootOf($, path)
+      follow = target === (await cwdOf($))
+      await reset($, target)
+    }
+    await revealPaths($, [path])
+    await reveal($, [path])
+    await patch($, () => ({ selected: path }))
+    return {}
   })
 
   on('ui.message', async ($, e, next) => {
@@ -1168,8 +1343,18 @@ export const register: Register = (on, options) => {
     const untracked = new Set(t.untrackedDirs)
     const width = Math.max(24, e.props.bodyColumns)
     const rows = visibleRows(t)
-    const fixed = 2 + (t.top ? (t.branch ? 1 : 0) : 1) + (t.selected || latest ? 1 : 0)
-    const room = Math.max(5, (e.props.scroll?.bodyRows ?? 40) - fixed)
+    // arxwork: the desktop's card stack and touched list, worked out first: the tree gets the rows they leave.
+    const desk = e.surface === 'desktop'
+    if (desk) deskSeen = true
+    const claude = desk ? await claudeActivity($) : NO_CLAUDE
+    const stack = desk ? stackFor(t, claude, live, now) : null
+    const touchedAll = desk ? [...claude.touched].reverse() : []
+    const touchedShown = touchedAll.slice(0, TOUCHED_ROWS)
+    // Cards keep a fixed height whatever the pane's width.
+    const stackRows = stack ? stack.length * CARD_ROWS + (stack.length - 1) * CARD_GAP : 0
+    const touchedTile = touchedAll.length ? 5 + (touchedShown.length + (touchedAll.length > TOUCHED_ROWS ? 1 : 0)) * DESK.rowHeight : 0
+    const fixed = desk ? DESK.fixedRows + stackRows + touchedTile : 2 + (t.top ? (t.branch ? 1 : 0) : 1) + (t.selected || latest ? 1 : 0)
+    const room = e.surface === 'desktop' ? Math.max(3, Math.floor(((e.props.scroll?.bodyRows ?? 40) - fixed) / DESK.rowHeight)) : Math.max(5, (e.props.scroll?.bodyRows ?? 40) - fixed)
     const isLit = (id: string) => bright.has(id) || dimmed.has(id)
     const focus = followClaude && t.flashOn ? ([...t.flash].reverse().find(id => id !== BRANCH_ROW) ?? t.cursor) : t.cursor
     const at = Math.max(0, rows.findIndex(r => r.node.id === focus))
@@ -1200,6 +1385,50 @@ export const register: Register = (on, options) => {
       return out
     }
     const rootCounts = t.top ? countSegs(t.counts[t.root]) : []
+    const rowState = (id: string): RowState | undefined => {
+      const cur = claude.now
+      if (cur?.running && cur.path === id) return cur.kind === 'edit' ? 'editing' : 'reading'
+      if (bright.has(id)) {
+        const tone = t.flashTones[id]
+        if (tone === 'green') return 'committed'
+        if (tone === 'orange') return 'edited'
+        if (tone === 'purple') return 'read'
+      }
+      const done = claude.committed
+      if (done && now - done.at < DESK.committedMs && done.paths.includes(id) && !t.git[id]) return 'committed'
+      return undefined
+    }
+    const DeskSvg = e.surface === 'desktop' ? $.ui.resolve(e).Svg : null
+    // The card stack: native boxes of a fixed height that stretch with the pane, newest on top and
+    // each one lower a little fainter; the card Claude is working on right now has a border of its color.
+    const cardBox = (c: CardInput, i: number) => {
+      const amount = CARD_FADE[i] ?? 0.5
+      const tone = CARD_COLORS[c.tone]
+      const live = c.time === 'Right now'
+      return (
+        <Box flexDirection="row" alignItems="center" gap={1} width="100%" height={CARD_ROWS} paddingX={1} borderStyle="round" borderColor={live ? tone : CARD_COLORS.border} backgroundColor={CARD_COLORS.card}>
+          {DeskSvg && <DeskSvg source={toneIconSvg(c.tone, amount)} alt={c.tone} width={CARD_ICON_PX} height={CARD_ICON_PX} />}
+          <Box flexDirection="column" flexGrow={1} flexShrink={1} overflow="hidden">
+            <Box flexDirection="row" alignItems="center" gap={1}>
+              {c.action && DeskSvg && <DeskSvg source={tagSvg(c.action, fade(tone, amount), tone, 0.18 * amount)} alt={c.action} width={tagPx(c.action)} height={TAG_PX_H} />}
+              <Box flexShrink={1} overflow="hidden">
+                <Text bold color={fade(c.tone === 'idle' ? CARD_COLORS.muted : CARD_COLORS.text, amount)} wrap="truncate-end">
+                  {c.title}
+                </Text>
+              </Box>
+              <Box flexGrow={1} />
+              {c.time && DeskSvg && (
+                <Box flexShrink={0}>
+                  <DeskSvg source={timeSvg(c.time, fade(live ? tone : CARD_COLORS.muted, amount))} alt={c.time} width={timePx(c.time)} height={TAG_PX_H} />
+                </Box>
+              )}
+            </Box>
+            {c.tag && DeskSvg && <DeskSvg source={tagSvg(fit(c.tag, 34), fade(CARD_COLORS.muted, amount), CARD_COLORS.tag, 1, amount)} alt={c.tag} width={tagPx(fit(c.tag, 34))} height={TAG_PX_H} />}
+          </Box>
+        </Box>
+      )
+    }
+    const cardEl = stack ? <Box flexDirection="column" width="100%" gap={CARD_GAP}>{stack.map(cardBox)}</Box> : null
     const header = t.top ? [t.top.split('/').pop() ?? t.top, t.prefix.replace(/\/$/, '')].filter(Boolean).join('/') : t.root.split('/').pop() || t.root
 
     const rowSpec = (r: (typeof rows)[number]): RowSpec => {
@@ -1214,6 +1443,43 @@ export const register: Register = (on, options) => {
       const iconColor = isIgnored ? theme.muted : (gitColor ?? (n.hidden ? theme.muted : n.kind === 'dir' ? theme.accent : theme.muted))
       const nameColor = isIgnored ? theme.muted : (gitColor ?? (n.hidden ? theme.muted : theme.fg || undefined))
       const loc = t.diff[n.id]
+      if (desk) {
+        // arxwork: desktop rows: type badges, a colored bar and pill while Claude works on a file.
+        const state = rowState(n.id)
+        const look = state ? ROW_STATES[state] : undefined
+        const counts = n.kind === 'dir' ? t.counts[n.id] : undefined
+        const changed = counts ? counts[0] + counts[1] + counts[2] : 0
+        const quiet = isIgnored || n.hidden
+        const tone = state === 'committed' ? 'green' : state === 'reading' || state === 'read' ? 'purple' : 'orange'
+        const shimmering = state && (state === 'editing' || state === 'reading' || bright.has(n.id))
+        const caret = n.kind === 'dir' ? (r.open ? '▾ ' : '▸ ') : '  '
+        const badge = n.kind === 'dir' ? null : fileBadge(n.name)
+        // The icon itself is an SVG the pane draws over this blank slot (see ICON_CELLS).
+        const ink = quiet ? DESK.muted : badge ? badge.color : changed || status ? DESK.changed : DESK.folder
+        // Indent, arrow and icon slot are fixed-width boxes, so the name never drifts under the icon.
+        const icon: Seg[] = [{ t: '', w: ICON_CELLS + 1 }]
+        const iconSpec = { at: r.depth * 2 + caret.length, color: ink, ...(badge ? { label: badge.label } : { open: r.open }) }
+        const right: Seg[] = []
+        if (look) right.push({ t: '', w: pillCells(look.label) })
+        else if (t.showSize && (n.kind !== 'dir' || n.id in t.dirSizes)) right.push({ t: ` ${n.kind === 'dir' ? formatSize(t.dirSizes[n.id] ?? -1) : formatSize(n.size)}`, c: DESK.muted })
+        else if (loc && (loc[0] || loc[1])) {
+          if (loc[0]) right.push({ t: ` +${loc[0]}`, c: ADD_COLOR })
+          if (loc[1]) right.push({ t: ` -${loc[1]}`, c: DEL_COLOR })
+        } else if (changed) right.push({ t: ` ${changed} changed`, c: DESK.changed })
+        else if (n.kind === 'file') right.push({ t: ` ${shortStamp(n.mtime, now)}`, c: DESK.muted })
+        else if (status === 'D') right.push({ t: ' deleted', c: theme.urgent })
+        const used = r.depth * 2 + caret.length + ICON_CELLS + 1 + right.reduce((s, x) => s + (x.w ?? [...x.t].length), 0) + 2
+        const cols = Math.max(4, width - used)
+        const name = n.name.length > cols ? n.name.slice(0, cols - 1) + '…' : n.name
+        const nameColor = quiet ? DESK.muted : status === 'D' ? theme.urgent : status || changed ? DESK.changed : DESK.text
+        const nameSeg: Seg = shimmering
+          ? { t: name, sh: tone, b: true }
+          : look
+            ? { t: name, c: look.pill, b: true }
+            : { t: name, c: nameColor, b: n.id === t.selected, s: status === 'D' && n.kind !== 'dir' }
+        const left: Seg[] = [{ t: '', w: r.depth * 2 }, { t: caret.trim(), c: DESK.muted, w: caret.length }, ...icon, nameSeg]
+        return { id: n.id, left: clean(left), right: clean(right), icon: iconSpec, ...(look ? { bar: look.bar, pill: { label: look.label, color: look.pill, bg: look.pillBg } } : {}) }
+      }
       const meta = t.showSize
         ? n.kind === 'dir'
           ? n.id in t.dirSizes
@@ -1304,7 +1570,7 @@ export const register: Register = (on, options) => {
     const chip = (a: Activity) => {
       const tone = a.state === 'failed' ? 'red' : a.tone
       const color = TONES[tone]?.solid ?? theme.accent
-      const icon = unicode ? a.plain : a.nerd
+      const icon = desk ? '●' : unicode ? a.plain : a.nerd
       const hash = a.state === 'done' && a.kind === 'git commit' ? a.detail.split(' ')[0] ?? '' : ''
       return (
         <Box flexDirection="row" marginLeft={2}>
@@ -1317,8 +1583,110 @@ export const register: Register = (on, options) => {
       )
     }
 
+    // arxwork: the desktop's search field and labelled buttons, the same actions as the terminal's icons.
+    // Each row's SVG icon and status pill, laid over the blank cells the row keeps for them;
+    // `inset`: cells at the right edge taken by something else (the tree's scrollbar).
+    const icons = (rowSpecs: RowSpec[], inset = 0) =>
+      DeskSvg
+        ? rowSpecs.flatMap((s, i) => [
+            s.icon ? (
+              <Box position="absolute" top={i * DESK.rowHeight} left={s.icon.at} width={ICON_CELLS} height={DESK.rowHeight} alignItems="center" justifyContent="center">
+                <DeskSvg source={iconSvg(s.icon)} alt={s.icon.label ? `${s.icon.label} file` : 'folder'} width={ICON_PX} height={ICON_PX} />
+              </Box>
+            ) : null,
+            s.pill ? (
+              <Box position="absolute" top={i * DESK.rowHeight} right={inset} width={pillCells(s.pill.label)} height={DESK.rowHeight} alignItems="center" justifyContent="flex-end">
+                <DeskSvg source={pillSvg(s.pill)} alt={s.pill.label} width={pillPx(s.pill.label)} height={18} />
+              </Box>
+            ) : null,
+          ])
+        : null
+
+    // The "Claude touched" list: every file Claude read, edited or committed this session, newest first.
+    const touchedSpecs: RowSpec[] = touchedShown.map(x => {
+      const cur = claude.now
+      const running = Boolean(cur?.running && cur.path === x.path)
+      const state: RowState = running ? (cur?.kind === 'edit' ? 'editing' : 'reading') : x.kind === 'commit' ? 'committed' : x.kind === 'edit' || x.edited ? 'edited' : 'read'
+      const look = ROW_STATES[state]
+      const name = x.path.split('/').pop() || x.path
+      const dir = dirname(x.path)
+      const where = inside(t.root, dir) ? (dir === t.root ? '' : dir.slice(t.root.length).replace(/^\/+/, '')) : dir.split('/').slice(-2).join('/')
+      const badge = fileBadge(name)
+      const pillW = pillCells(look.label)
+      const cols = Math.max(6, width - 4 - (ICON_CELLS + 1) - pillW - 2)
+      const shownName = name.length > cols ? name.slice(0, cols - 1) + '…' : name
+      const room = cols - shownName.length - 2
+      const shownWhere = where && room > 3 ? (where.length > room ? '…' + where.slice(where.length - room + 1) : where) : ''
+      const tone = state === 'committed' ? 'green' : state === 'reading' || state === 'read' ? 'purple' : 'orange'
+      return {
+        id: x.path,
+        left: clean([{ t: '', w: ICON_CELLS + 1 }, running ? { t: shownName, sh: tone, b: true } : { t: shownName, c: DESK.text, b: true }, ...(shownWhere ? [{ t: `  ${shownWhere}`, c: DESK.muted }] : [])]),
+        right: [{ t: '', w: pillW }],
+        icon: { at: 0, color: badge.color, label: badge.label },
+        pill: { label: look.label, color: look.pill, bg: look.pillBg },
+      }
+    })
+    if (touchedAll.length > TOUCHED_ROWS) touchedSpecs.push({ id: '', left: [{ t: '', w: ICON_CELLS + 1 }, { t: `+${touchedAll.length - TOUCHED_ROWS} more`, c: DESK.muted }], right: [] })
+
+    const deskControls = () => (
+      <Box flexDirection="column">
+        <Box flexDirection="row" alignItems="center">
+          <Box flexGrow={1}>
+            <Input key="q" placeholder="Find a file" submitLabel="Jump" value={t.query} onInput={(v: string) => void search($, v)} onSubmit={(v: string) => void jump($, v)} />
+          </Box>
+          {t.query ? <Button key="clear" label="Clear" onPress={() => void search($, '')} /> : null}
+        </Box>
+        <Box flexDirection="row" flexWrap="wrap" gap={1} marginTop={1}>
+          <Button
+            key="refresh"
+            label="Refresh"
+            onPress={() =>
+              void (async () => {
+                const cur = await get($)
+                searchIndex = null
+                await staleSizes($)
+                await loadDirs($, [cur.root, ...cur.expanded])
+                await detectRepo($)
+                await refreshGit($)
+                if (cur.query.trim()) await search($, cur.query)
+              })()
+            }
+          />
+          <Button key="collapse" label="Collapse all" onPress={() => void patch($, cur => ({ expanded: [], nodes: dropBelow(cur.nodes, cur.nodes.filter(x => x.parent === cur.root && x.kind === 'dir').map(x => x.id)) }))} />
+          <Button key="size" label={t.showSize ? 'Show dates' : 'Show sizes'} onPress={() => void patch($, cur => ({ showSize: !cur.showSize }))} />
+          <Button
+            key="up"
+            label="Up a folder"
+            onPress={() =>
+              void (async () => {
+                follow = false
+                await reset($, dirname(t.root))
+              })()
+            }
+          />
+          {!follow && (
+            <Button
+              key="cwd"
+              label="Back to project"
+              onPress={() =>
+                void (async () => {
+                  follow = true
+                  await reset($, await cwdOf($))
+                })()
+              }
+            />
+          )}
+          <Button key="hidden" label={t.showHidden ? 'Hide hidden files' : 'Show hidden files'} onPress={() => void patch($, cur => ({ showHidden: !cur.showHidden }))} />
+          {t.selected && <Button key="unselect" label="Clear selection" onPress={() => void patch($, () => ({ selected: '' }))} />}
+        </Box>
+      </Box>
+    )
+
     return (
       <Box flexDirection="column" minHeight={Math.max(1, e.props.scroll?.bodyRows ?? 1)} backgroundColor={theme.bg || undefined}>
+        {cardEl && <Box flexDirection="column" width="100%" marginBottom={1}>{cardEl}</Box>}
+        {desk && deskControls()}
+        {!desk && (
         <Box flexDirection="row">
           <Text bold color={theme.accent} wrap="truncate-start">
             {header}
@@ -1387,8 +1755,10 @@ export const register: Register = (on, options) => {
             <Text> </Text>
           </Box>
         </Box>
-        {branchRow()}
-        {!t.top && <Text color={theme.muted}>{unicode ? '± ' : '\u{e702} '}no git repo · git status starts after git init</Text>}
+        )}
+        {!cardEl && branchRow()}
+        {!cardEl && !t.top && <Text color={theme.muted}>{unicode ? '± ' : '\u{e702} '}no git repo · git status starts after git init</Text>}
+        {!desk && (
         <Box flexDirection="row">
           <Box flexGrow={1}>
             <Input
@@ -1404,11 +1774,47 @@ export const register: Register = (on, options) => {
           </Box>
           {t.query ? <Button key="clear" plain dimColor label={unicode ? '×' : '\u{f0156}'} onPress={() => void search($, '')} /> : null}
         </Box>
+        )}
+        {desk ? (
+          <Box flexDirection="column" borderStyle="round" borderColor={DESK.tileBorder} backgroundColor={DESK.tile} paddingX={1} marginTop={1}>
+            <Box flexDirection="row" marginBottom={1}>
+              <Text bold color={DESK.muted}>ALL FILES</Text>
+              <Box flexGrow={1} />
+              <Text bold color={DESK.muted} wrap="truncate-start">{header.toUpperCase()}</Text>
+            </Box>
+            <Box position="relative" flexDirection="column">
+              <Client
+                key="rows"
+                module="./rows.tsx"
+                props={{ rows: specs, active: t.cursor, activeBg: DESK.selected, hoverBg: DESK.hover, tones: SHIMMER, pointer, rowHeight: DESK.rowHeight, ...(bar ? { bar } : {}) } satisfies RowsProps}
+              />
+              {icons(specs, bar ? 1 : 0)}
+            </Box>
+          </Box>
+        ) : (
         <Client
           key="rows"
           module="./rows.tsx"
           props={{ rows: specs, active: t.cursor, activeBg: theme.selection, hoverBg: faint(theme.selection), tones: SHIMMER, pointer, ...(bar ? { bar } : {}) } satisfies RowsProps}
         />
+        )}
+        {touchedSpecs.length > 0 && (
+          <Box flexDirection="column" borderStyle="round" borderColor={DESK.tileBorder} backgroundColor={DESK.tile} paddingX={1} marginTop={1}>
+            <Box flexDirection="row" marginBottom={1}>
+              <Text bold color={DESK.muted}>CLAUDE TOUCHED</Text>
+              <Box flexGrow={1} />
+              <Text bold color={DESK.muted}>{`${touchedAll.length} FILE${touchedAll.length === 1 ? '' : 'S'}`}</Text>
+            </Box>
+            <Box position="relative" flexDirection="column">
+              <Client
+                key="touched"
+                module="./rows.tsx"
+                props={{ rows: touchedSpecs, active: '', activeBg: DESK.selected, hoverBg: DESK.hover, tones: SHIMMER, pointer, rowHeight: DESK.rowHeight } satisfies RowsProps}
+              />
+              {icons(touchedSpecs)}
+            </Box>
+          </Box>
+        )}
         <Box flexGrow={1} />
         {(t.selected || latest) && (
           <Box flexDirection="row">

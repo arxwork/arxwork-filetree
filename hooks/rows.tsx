@@ -1,7 +1,18 @@
 import type { ClientModule } from 'claude-code'
 
-export type Seg = { t: string; c?: string; b?: boolean; s?: boolean; i?: boolean; sh?: string; dim?: boolean; one?: boolean; spin?: boolean; bg?: string; tab?: string }
-export type RowSpec = { id: string; left: Seg[]; right: Seg[] }
+export type Seg = { t: string; c?: string; b?: boolean; s?: boolean; i?: boolean; sh?: string; dim?: boolean; one?: boolean; spin?: boolean; bg?: string; tab?: string; w?: number }
+// arxwork: `w` draws the segment in a box exactly that many cells wide, so text in a
+// proportional font cannot drift from what the pane places by cells (the desktop icons).
+export type RowSpec = {
+  id: string
+  left: Seg[]
+  right: Seg[]
+  bar?: string
+  // arxwork: the desktop draws this icon over the row, `at` cells from its left edge.
+  icon?: { at: number; label?: string; color: string; open?: boolean }
+  // arxwork: a rounded status pill the desktop draws over the row's last right-hand cells.
+  pill?: { label: string; color: string; bg: string }
+}
 export type RowsProps = {
   rows: RowSpec[]
   active: string
@@ -10,6 +21,8 @@ export type RowsProps = {
   tones: Record<string, { bright: string[]; dim: string[] }>
   spinner?: string[]
   pointer?: boolean
+  // arxwork: cells per row; the desktop tree draws roomier rows.
+  rowHeight?: number
   bar?: { pos: number; size: number; thumb: string; track: string }
 }
 type Local = { hover: number; phase: number; drag: boolean; ref: { stop?: () => void; unpoint?: () => void } }
@@ -25,6 +38,7 @@ function shimmer(i: number, phase: number, len: number, palette: string[]): stri
 
 const Rows: ClientModule<RowsProps, Local> = (props, surface) => {
   const { Box, Text } = surface.elements
+  const rh = Math.max(1, props.rowHeight ?? 1)
   let state = surface.state
   if (state === undefined) {
     state = { hover: -1, phase: 0, drag: false, ref: {} }
@@ -46,6 +60,7 @@ const Rows: ClientModule<RowsProps, Local> = (props, surface) => {
   } else state.ref.unpoint = surface.onPointer(e => {
     const cur = surface.state ?? state
     const span = Math.max(1, props.rows.length - 1)
+    const y = Math.floor(e.y / rh)
     const onBar = Boolean(props.bar) && e.x >= surface.columns - 1
     if (props.bar && (cur.drag || (onBar && e.type === 'down' && (e.button ?? 'left') === 'left'))) {
       if (e.type === 'up' || e.type === 'leave') {
@@ -54,16 +69,16 @@ const Rows: ClientModule<RowsProps, Local> = (props, surface) => {
       }
       if (e.type === 'down' || e.type === 'move') {
         if (!cur.drag) surface.setState({ ...cur, drag: true, hover: -1 })
-        surface.post({ scrollTo: Math.max(0, Math.min(1, e.y / span)) })
+        surface.post({ scrollTo: Math.max(0, Math.min(1, (e.y / rh) / span)) })
         return
       }
     }
-    if (e.type === 'leave' || e.y < 0 || e.y >= props.rows.length) {
+    if (e.type === 'leave' || y < 0 || y >= props.rows.length) {
       if (cur.hover !== -1) surface.setState({ ...cur, hover: -1 })
       return
     }
-    if (e.type === 'move' && !e.button && cur.hover !== e.y) surface.setState({ ...cur, hover: e.y })
-    const row = props.rows[e.y]
+    if (e.type === 'move' && !e.button && cur.hover !== y) surface.setState({ ...cur, hover: y })
+    const row = props.rows[y]
     if (e.type === 'down' && e.button === 'right' && row?.id) {
       surface.post({ copy: row.id, shift: Boolean(e.shift) })
       return
@@ -83,6 +98,13 @@ const Rows: ClientModule<RowsProps, Local> = (props, surface) => {
   surface.onKey(e => surface.post({ key: e.key, ctrl: Boolean(e.ctrl), shift: Boolean(e.shift) }))
   const frames = props.spinner?.length ? props.spinner : FRAMES
   const draw = (s: Seg) => {
+    if (s.w !== undefined) {
+      return (
+        <Box width={s.w} flexShrink={0}>
+          {s.t ? <Text color={s.c} bold={s.b}>{s.t}</Text> : null}
+        </Box>
+      )
+    }
     if (s.spin) {
       return (
         <Text color={s.c} bold={s.b}>
@@ -119,9 +141,10 @@ const Rows: ClientModule<RowsProps, Local> = (props, surface) => {
       {props.rows.map((r, i) => (
         <Box
           flexDirection="row"
-          height={1}
+          height={rh}
+          alignItems="center"
           overflow="hidden"
-          backgroundColor={r.id && r.id === props.active ? props.activeBg : r.id && i === state.hover ? props.hoverBg : undefined}
+          backgroundColor={r.bar ?? (r.id && r.id === props.active ? props.activeBg : r.id && i === state.hover ? props.hoverBg : undefined)}
         >
           <Box flexShrink={1} overflow="hidden">
             {r.left.map(draw)}

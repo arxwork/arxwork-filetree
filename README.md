@@ -6,7 +6,7 @@
 
 <p align="center">
   <img src="https://img.shields.io/badge/Claude_Code-%E2%89%A5_2.1.287-D97757?logo=claude&logoColor=fff" alt="Claude Code 2.1.287 or newer">
-  <img src="https://img.shields.io/badge/version-0.2.24-blue" alt="Version">
+  <img src="https://img.shields.io/badge/version-0.3.0-blue" alt="Version">
   <img src="https://img.shields.io/badge/type-mod-6f42c1" alt="Claude Code mod">
   <img src="https://img.shields.io/badge/license-MIT-green" alt="License">
 </p>
@@ -19,6 +19,22 @@
 > filetree is a Claude Code **mod** and needs **Claude Code 2.1.287+**. It shows in the right sidebar, which needs the fullscreen layout (`/tui fullscreen`) and a terminal at least 110 columns wide. Tested on Linux, macOS and Windows; mods don't load in WSL sessions of the Desktop app.
 
 ---
+
+## This fork (arxwork)
+
+A desktop-app redesign of [data-goblin/claude-code-filetree](https://github.com/data-goblin/claude-code-filetree). The terminal pane is unchanged; in the Claude desktop app the pane shows:
+
+- **Activity cards**: up to five, newest on top, one per file Claude reads, edits or commits, each with an action tag (`EDITING`, `READ`, `COMMITTED`), the file name, how long ago, and a `PROJECT > FOLDER` tag
+- **Search and labelled buttons**: Refresh, Collapse all, Show sizes, Up a folder, Back to project, Show/Hide hidden files
+- **The file tree** in a rounded tile, with SVG folder and file-type icons, roomier rows, and an orange, purple or green bar and pill on the file Claude is editing, reading or has committed; it moves to the project Claude is editing in
+- **Claude touched**: every file Claude read, edited or committed this session; click one to show it in the tree
+
+Install this fork:
+
+```bash
+claude plugin marketplace add arxwork/arxwork-filetree
+claude plugin install filetree@arxwork-filetree
+```
 
 ## Installation
 

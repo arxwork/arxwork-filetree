@@ -53,6 +53,30 @@ export type FileTree = {
   scroll: number | null
 }
 
+// arxwork: what Claude is doing now and every file it touched this session.
+// kind: the latest thing done to the file; edited: whether it was ever edited this session.
+export type ClaudeTouch = {
+  path: string
+  kind: 'read' | 'edit' | 'commit'
+  at: number
+  edited?: boolean
+}
+
+// paths: every file in the current burst of same-kind activity, `path` the latest.
+export type ClaudeNow = {
+  path: string
+  kind: 'read' | 'edit'
+  at: number
+  running: boolean
+  paths?: string[]
+}
+
+export type ClaudeActivity = {
+  now: ClaudeNow | null
+  touched: ClaudeTouch[]
+  committed?: { paths: string[]; at: number }
+}
+
 export type Theme = {
   fg: string
   accent: string
@@ -68,6 +92,7 @@ declare module 'claude-code' {
       tree: FileTree
       theme: Theme
       activity: Activity[]
+      claude: ClaudeActivity
     }
   }
 }
